@@ -1,0 +1,490 @@
+"""
+Trade Opportunities API
+FastAPI service that analyzes market data and provides trade opportunity insights
+for specific sectors in India.
+"""
+
+import time
+import uuid
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Depends, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+from config import settings
+from models import AnalysisResponse, SessionInfo, ErrorResponse
+from auth import verify_token, create_guest_token
+from rate_limiter import RateLimiter
+from analyzer import TradeAnalyzer
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+sessions: dict[str, SessionInfo] = {}
+analysis_cache: dict[str, dict] = {}
+
+rate_limiter = RateLimiter(
+    max_requests=settings.RATE_LIMIT_REQUESTS,
+    window_seconds=settings.RATE_LIMIT_WINDOW,
+)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Trade Opportunities API starting up ...")
+    yield
+    logger.info("Trade Opportunities API shutting down.")
+
+app = FastAPI(
+    title="Trade Opportunities API",
+    description="Analyzes market data and provides trade opportunity insights for specific sectors in India.",
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+security = HTTPBearer(auto_error=False)
+
+async def get_current_session(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+) -> str:
+    if credentials:
+        session_id = verify_token(credentials.credentials)
+        if session_id not in sessions:
+            sessions[session_id] = SessionInfo(session_id=session_id)
+        sessions[session_id].last_active = time.time()
+        return session_id
+    session_id = str(uuid.uuid4())
+    sessions[session_id] = SessionInfo(session_id=session_id)
+    return session_id
+
+async def check_rate_limit(
+    request: Request,
+    session_id: str = Depends(get_current_session),
+) -> str:
+    client_ip = request.client.host if request.client else "unknown"
+    key = f"{session_id}:{client_ip}"
+    if not rate_limiter.is_allowed(key):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error": "Rate limit exceeded",
+                "message": f"Maximum {settings.RATE_LIMIT_REQUESTS} requests per {settings.RATE_LIMIT_WINDOW}s allowed.",
+                "retry_after": rate_limiter.retry_after(key),
+            },
+        )
+    return session_id
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail, "status_code": exc.status_code})
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception: %s", exc)
+    return JSONResponse(status_code=500, content={"error": "Internal server error", "status_code": 500})
+
+FRONTEND_HTML = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>TradeScope India — Market Intelligence</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:ital,wght@0,300;0,400;1,300&family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,600;1,9..144,300&display=swap" rel="stylesheet"/>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+:root {
+  --bg: #0a0a08;
+  --surface: #111110;
+  --surface2: #1a1a18;
+  --border: #2a2a26;
+  --gold: #c9a84c;
+  --gold-light: #e8c96a;
+  --gold-dim: #7a6030;
+  --text: #e8e6df;
+  --text-dim: #8a8880;
+  --text-muted: #555550;
+  --green: #4caf7a;
+  --red: #e05c5c;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body { background: var(--bg); color: var(--text); font-family: 'DM Mono', monospace; min-height: 100vh; overflow-x: hidden; }
+body::before {
+  content: ''; position: fixed; inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E");
+  pointer-events: none; z-index: 0; opacity: 0.4;
+}
+.hero {
+  position: relative; min-height: 100vh;
+  display: flex; flex-direction: column; justify-content: center; align-items: center;
+  text-align: center; padding: 2rem; overflow: hidden;
+}
+.hero-grid {
+  position: absolute; inset: 0;
+  background-image: linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px);
+  background-size: 60px 60px; opacity: 0.3;
+  mask-image: radial-gradient(ellipse 80% 60% at 50% 50%, black 30%, transparent 100%);
+}
+.hero-glow {
+  position: absolute; width: 600px; height: 300px;
+  background: radial-gradient(ellipse, rgba(201,168,76,0.12) 0%, transparent 70%);
+  top: 50%; left: 50%; transform: translate(-50%, -60%); pointer-events: none;
+}
+.tag {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 0.7rem; letter-spacing: 0.2em; text-transform: uppercase;
+  color: var(--gold); border: 1px solid var(--gold-dim);
+  padding: 6px 16px; border-radius: 2px; margin-bottom: 2rem;
+  animation: fadeUp 0.6s ease both;
+}
+.tag::before { content: ''; width: 6px; height: 6px; background: var(--gold); border-radius: 50%; animation: pulse 2s ease infinite; }
+@keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.4;transform:scale(.7)} }
+h1 { font-family: 'Fraunces', serif; font-size: clamp(3rem,8vw,7rem); font-weight: 300; line-height: 1; letter-spacing: -0.02em; color: var(--text); animation: fadeUp 0.6s 0.1s ease both; }
+h1 em { font-style: italic; color: var(--gold); }
+.hero-sub { font-size: 0.85rem; color: var(--text-dim); max-width: 500px; line-height: 1.8; margin-top: 1.5rem; animation: fadeUp 0.6s 0.2s ease both; }
+.scroll-hint { position: absolute; bottom: 2rem; display: flex; flex-direction: column; align-items: center; gap: 8px; color: var(--text-muted); font-size: 0.65rem; letter-spacing: 0.15em; text-transform: uppercase; animation: fadeUp 0.6s 0.5s ease both; }
+.scroll-line { width: 1px; height: 40px; background: linear-gradient(var(--gold), transparent); animation: scrollAnim 2s ease infinite; }
+@keyframes scrollAnim { 0%{transform:scaleY(0);transform-origin:top} 50%{transform:scaleY(1);transform-origin:top} 51%{transform:scaleY(1);transform-origin:bottom} 100%{transform:scaleY(0);transform-origin:bottom} }
+.main { position: relative; z-index: 1; max-width: 1100px; margin: 0 auto; padding: 4rem 2rem 8rem; }
+.section-label { font-size: 0.65rem; letter-spacing: 0.25em; text-transform: uppercase; color: var(--gold); margin-bottom: 2rem; display: flex; align-items: center; gap: 12px; }
+.section-label::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+.sectors-title { font-family: 'Syne', sans-serif; font-size: 1.6rem; font-weight: 700; margin-bottom: 0.5rem; }
+.sectors-desc { color: var(--text-dim); font-size: 0.8rem; margin-bottom: 2.5rem; line-height: 1.7; }
+.sector-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); margin-bottom: 3rem; }
+.sector-card { background: var(--surface); padding: 1.5rem; cursor: pointer; transition: background 0.2s; position: relative; overflow: hidden; }
+.sector-card::before { content: ''; position: absolute; inset: 0; background: linear-gradient(135deg, rgba(201,168,76,0.08), transparent); opacity: 0; transition: opacity 0.3s; }
+.sector-card:hover { background: var(--surface2); }
+.sector-card:hover::before { opacity: 1; }
+.sector-card.active { background: var(--surface2); outline: 1px solid var(--gold); outline-offset: -1px; }
+.sector-card.active::before { opacity: 1; }
+.sector-icon { font-size: 1.6rem; margin-bottom: 0.75rem; display: block; }
+.sector-name { font-family: 'Syne', sans-serif; font-size: 0.9rem; font-weight: 700; text-transform: capitalize; margin-bottom: 0.3rem; }
+.sector-tag { font-size: 0.65rem; letter-spacing: 0.1em; color: var(--text-muted); text-transform: uppercase; }
+.sector-card.active .sector-name { color: var(--gold-light); }
+.sector-card.active .sector-tag { color: var(--gold-dim); }
+.custom-row { display: flex; gap: 1px; background: var(--border); border: 1px solid var(--border); margin-bottom: 3rem; }
+.custom-input { flex: 1; background: var(--surface); border: none; outline: none; padding: 1rem 1.5rem; font-family: 'DM Mono', monospace; font-size: 0.85rem; color: var(--text); }
+.custom-input::placeholder { color: var(--text-muted); }
+.custom-input:focus { background: var(--surface2); }
+.analyze-btn { background: var(--gold); color: var(--bg); border: none; outline: none; padding: 1rem 2rem; font-family: 'Syne', sans-serif; font-size: 0.8rem; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; cursor: pointer; transition: background 0.2s, transform 0.1s; white-space: nowrap; }
+.analyze-btn:hover { background: var(--gold-light); }
+.analyze-btn:active { transform: scale(0.98); }
+.analyze-btn:disabled { background: var(--gold-dim); cursor: not-allowed; opacity: 0.6; }
+.status-bar { display: flex; align-items: center; gap: 12px; padding: 0.75rem 1rem; background: var(--surface); border: 1px solid var(--border); font-size: 0.75rem; margin-bottom: 2rem; min-height: 44px; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); flex-shrink: 0; }
+.status-dot.loading { background: var(--gold); animation: pulse 1s ease infinite; }
+.status-dot.success { background: var(--green); }
+.status-dot.error { background: var(--red); }
+.status-text { color: var(--text-dim); flex: 1; }
+.status-meta { color: var(--text-muted); font-size: 0.7rem; }
+.report-wrapper { display: none; border: 1px solid var(--border); overflow: hidden; }
+.report-wrapper.visible { display: block; }
+.report-header { display: flex; align-items: center; justify-content: space-between; padding: 1rem 1.5rem; background: var(--surface); border-bottom: 1px solid var(--border); }
+.report-title { font-family: 'Syne', sans-serif; font-size: 0.85rem; font-weight: 700; text-transform: capitalize; }
+.report-actions { display: flex; gap: 8px; }
+.report-btn { background: transparent; border: 1px solid var(--border); color: var(--text-dim); padding: 5px 12px; font-family: 'DM Mono', monospace; font-size: 0.7rem; cursor: pointer; transition: all 0.2s; }
+.report-btn:hover { border-color: var(--gold); color: var(--gold); }
+.report-body { padding: 2.5rem; background: var(--surface); line-height: 1.8; font-size: 0.85rem; max-height: 70vh; overflow-y: auto; }
+.report-body::-webkit-scrollbar { width: 4px; }
+.report-body::-webkit-scrollbar-track { background: var(--surface); }
+.report-body::-webkit-scrollbar-thumb { background: var(--border); }
+.report-body h1 { font-family: 'Fraunces', serif; font-size: 1.8rem; font-weight: 300; color: var(--gold-light); margin-bottom: 1rem; padding-bottom: 0.75rem; border-bottom: 1px solid var(--border); }
+.report-body h2 { font-family: 'Syne', sans-serif; font-size: 1rem; font-weight: 700; color: var(--text); margin: 2rem 0 0.75rem; display: flex; align-items: center; gap: 10px; }
+.report-body h2::before { content: '▸'; color: var(--gold); font-size: 0.7rem; }
+.report-body h3 { font-family: 'Syne', sans-serif; font-size: 0.85rem; font-weight: 600; color: var(--gold); margin: 1.5rem 0 0.5rem; }
+.report-body p { margin-bottom: 0.75rem; color: var(--text-dim); }
+.report-body ul, .report-body ol { padding-left: 1.5rem; margin-bottom: 1rem; }
+.report-body li { margin-bottom: 0.4rem; color: var(--text-dim); }
+.report-body strong { color: var(--text); font-weight: 600; }
+.report-body em { color: var(--text-muted); font-style: italic; }
+.report-body table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; font-size: 0.8rem; }
+.report-body th { background: var(--surface2); padding: 0.6rem 1rem; text-align: left; font-family: 'Syne', sans-serif; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--gold); border: 1px solid var(--border); }
+.report-body td { padding: 0.6rem 1rem; border: 1px solid var(--border); color: var(--text-dim); }
+.report-body tr:hover td { background: var(--surface2); }
+.report-body blockquote { border-left: 3px solid var(--gold); padding: 0.75rem 1.25rem; background: var(--surface2); margin: 1rem 0; color: var(--text-dim); font-style: italic; }
+.report-body code { background: var(--surface2); padding: 2px 6px; font-size: 0.8em; color: var(--gold); }
+.report-body hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+.skeleton { display: none; padding: 2.5rem; background: var(--surface); border: 1px solid var(--border); }
+.skeleton.visible { display: block; }
+.skel-line { height: 12px; border-radius: 2px; background: linear-gradient(90deg, var(--surface2) 25%, var(--border) 50%, var(--surface2) 75%); background-size: 200% 100%; animation: shimmer 1.5s ease infinite; margin-bottom: 12px; }
+@keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+footer { border-top: 1px solid var(--border); padding: 2rem; text-align: center; font-size: 0.7rem; color: var(--text-muted); position: relative; z-index: 1; }
+footer span { color: var(--gold); }
+@keyframes fadeUp { from{opacity:0;transform:translateY(20px)} to{opacity:1;transform:translateY(0)} }
+.fade-in { animation: fadeUp 0.5s ease both; }
+@media (max-width: 600px) { .sector-grid{grid-template-columns:repeat(2,1fr)} .custom-row{flex-direction:column;gap:1px} .analyze-btn{width:100%} .report-body{padding:1.5rem} }
+</style>
+</head>
+<body>
+
+<section class="hero">
+  <div class="hero-grid"></div>
+  <div class="hero-glow"></div>
+  <div class="tag">India Trade Intelligence Platform</div>
+  <h1>Trade<em>Scope</em></h1>
+  <p class="hero-sub">AI-powered market analysis for India's key sectors. Select a sector below to generate a comprehensive trade opportunities report.</p>
+  <div class="scroll-hint">
+    <div class="scroll-line"></div>
+    scroll to explore
+  </div>
+</section>
+
+<main class="main">
+
+  <div class="section-label">Select Sector</div>
+  <div class="sectors-title">Choose a Market Sector</div>
+  <p class="sectors-desc">Click any card to select it, or type a custom sector name below.</p>
+  <div class="sector-grid" id="sectorGrid"></div>
+
+  <div class="custom-row">
+    <input class="custom-input" id="customSector" type="text"
+      placeholder="Or type a custom sector (e.g. defence, fintech, biotech) ..."
+      onkeydown="if(event.key==='Enter') runAnalysis()"/>
+    <button class="analyze-btn" id="analyzeBtn" onclick="runAnalysis()">⚡ Analyze</button>
+  </div>
+
+  <div class="status-bar" id="statusBar">
+    <div class="status-dot" id="statusDot"></div>
+    <div class="status-text" id="statusText">Select a sector or enter a custom one to begin analysis.</div>
+    <div class="status-meta" id="statusMeta"></div>
+  </div>
+
+  <div class="skeleton" id="skeleton">
+    <div class="skel-line" style="width:60%;height:20px;margin-bottom:20px"></div>
+    <div class="skel-line" style="width:100%"></div>
+    <div class="skel-line" style="width:90%"></div>
+    <div class="skel-line" style="width:95%"></div>
+    <div class="skel-line" style="width:40%;margin-top:24px;height:16px"></div>
+    <div class="skel-line" style="width:100%"></div>
+    <div class="skel-line" style="width:85%"></div>
+    <div class="skel-line" style="width:92%"></div>
+    <div class="skel-line" style="width:78%"></div>
+    <div class="skel-line" style="width:40%;margin-top:24px;height:16px"></div>
+    <div class="skel-line" style="width:100%"></div>
+    <div class="skel-line" style="width:88%"></div>
+  </div>
+
+  <div class="report-wrapper" id="reportWrapper">
+    <div class="report-header">
+      <div class="report-title" id="reportTitle">Report</div>
+      <div class="report-actions">
+        <button class="report-btn" onclick="copyReport()">Copy MD</button>
+        <button class="report-btn" onclick="downloadReport()">Download</button>
+        <button class="report-btn" onclick="clearReport()">Clear</button>
+      </div>
+    </div>
+    <div class="report-body" id="reportBody"></div>
+  </div>
+
+</main>
+
+<footer>
+  Built for <span>Appscrip</span> AI Engineer Assignment &nbsp;·&nbsp;
+  Powered by <span>Gemini</span> + <span>FastAPI</span> &nbsp;·&nbsp;
+  Deployed on <span>Render</span>
+</footer>
+
+<script>
+// Auto-detect API base from current page URL (works on Render and locally)
+const API_BASE = window.location.origin;
+
+const SECTORS = [
+  { name: "Pharmaceuticals", icon: "💊", tag: "Healthcare & Exports" },
+  { name: "Technology", icon: "💻", tag: "IT & Software" },
+  { name: "Agriculture", icon: "🌾", tag: "Food & Commodities" },
+  { name: "Textiles", icon: "🧵", tag: "Apparel & Fabric" },
+  { name: "Automotive", icon: "🚗", tag: "Vehicles & Parts" },
+  { name: "Chemicals", icon: "⚗️", tag: "Specialty & Bulk" },
+  { name: "Electronics", icon: "🔌", tag: "Consumer & Industrial" },
+  { name: "Renewable Energy", icon: "☀️", tag: "Solar & Wind" },
+  { name: "Defense", icon: "🛡️", tag: "Aerospace & Arms" },
+  { name: "Food Processing", icon: "🏭", tag: "FMCG & Exports" },
+  { name: "Gems & Jewelry", icon: "💎", tag: "Diamonds & Gold" },
+  { name: "Steel", icon: "⚙️", tag: "Metals & Mining" },
+  { name: "Oil & Gas", icon: "🛢️", tag: "Energy Sector" },
+  { name: "Banking & Finance", icon: "🏦", tag: "FinTech & BFSI" },
+  { name: "Telecom", icon: "📡", tag: "5G & Connectivity" },
+];
+
+let selectedSector = null;
+let lastReport = "";
+
+function renderSectors() {
+  const grid = document.getElementById("sectorGrid");
+  grid.innerHTML = SECTORS.map((s, i) => `
+    <div class="sector-card" id="card-${i}" onclick="selectSector('${s.name}', ${i})">
+      <span class="sector-icon">${s.icon}</span>
+      <div class="sector-name">${s.name}</div>
+      <div class="sector-tag">${s.tag}</div>
+    </div>
+  `).join("");
+}
+
+function selectSector(name, idx) {
+  document.querySelectorAll(".sector-card").forEach(c => c.classList.remove("active"));
+  document.getElementById(`card-${idx}`).classList.add("active");
+  selectedSector = name;
+  document.getElementById("customSector").value = "";
+  setStatus("idle", `Selected: ${name} — click Analyze to generate report`);
+}
+
+function setStatus(state, msg, meta = "") {
+  const dot = document.getElementById("statusDot");
+  dot.className = "status-dot" + (state !== "idle" ? " " + state : "");
+  document.getElementById("statusText").textContent = msg;
+  document.getElementById("statusMeta").textContent = meta;
+}
+
+async function runAnalysis() {
+  const custom = document.getElementById("customSector").value.trim();
+  const sector = custom || selectedSector;
+  if (!sector) { setStatus("error", "Please select a sector or enter a custom one."); return; }
+
+  const btn = document.getElementById("analyzeBtn");
+  btn.disabled = true;
+  btn.textContent = "Analyzing...";
+
+  document.getElementById("skeleton").classList.add("visible");
+  document.getElementById("reportWrapper").classList.remove("visible");
+  setStatus("loading", `Fetching market data for "${sector}"...`, "This may take 15-30s on a cold start");
+
+  const start = Date.now();
+  try {
+    const url = `${API_BASE}/analyze/${encodeURIComponent(sector.toLowerCase())}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || err.error || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+    lastReport = data.report || "";
+    document.getElementById("reportTitle").textContent = `${sector} — Trade Report`;
+    document.getElementById("reportBody").innerHTML = marked.parse(lastReport);
+    document.getElementById("skeleton").classList.remove("visible");
+    document.getElementById("reportWrapper").classList.add("visible");
+    document.getElementById("reportWrapper").classList.add("fade-in");
+    setStatus("success", `Report generated in ${elapsed}s${data.cached ? " (cached)" : ""}`, `Model: ${data.metadata?.analysis_model || "—"}`);
+  } catch (err) {
+    document.getElementById("skeleton").classList.remove("visible");
+    setStatus("error", `Error: ${err.message}`, "Check that your server is running and GEMINI_API_KEY is set.");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "⚡ Analyze";
+  }
+}
+
+function copyReport() {
+  if (!lastReport) return;
+  navigator.clipboard.writeText(lastReport).then(() => setStatus("success", "Markdown copied to clipboard."));
+}
+
+function downloadReport() {
+  if (!lastReport) return;
+  const title = document.getElementById("reportTitle").textContent.replace(/[^a-z0-9]/gi, "_").toLowerCase();
+  const blob = new Blob([lastReport], { type: "text/markdown" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `${title}.md`;
+  a.click();
+}
+
+function clearReport() {
+  document.getElementById("reportWrapper").classList.remove("visible");
+  lastReport = "";
+  selectedSector = null;
+  document.querySelectorAll(".sector-card").forEach(c => c.classList.remove("active"));
+  setStatus("idle", "Select a sector or enter a custom one to begin analysis.");
+}
+
+renderSectors();
+</script>
+</body>
+</html>
+
+'''
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def serve_frontend():
+    return HTMLResponse(content=FRONTEND_HTML)
+
+@app.get("/health", tags=["Health"])
+async def health():
+    return {"service": "Trade Opportunities API", "status": "running", "version": "1.0.0", "docs": "/docs"}
+
+@app.post("/auth/token", tags=["Auth"])
+async def get_token():
+    token, session_id = create_guest_token()
+    sessions[session_id] = SessionInfo(session_id=session_id)
+    return {"access_token": token, "token_type": "bearer", "session_id": session_id}
+
+@app.get(
+    "/analyze/{sector}",
+    response_model=AnalysisResponse,
+    tags=["Analysis"],
+    summary="Get trade opportunity analysis for an Indian market sector",
+)
+async def analyze_sector(
+    sector: str,
+    request: Request,
+    session_id: str = Depends(check_rate_limit),
+    force_refresh: bool = False,
+):
+    sector_clean = sector.strip().lower()
+    if not sector_clean or len(sector_clean) < 2 or len(sector_clean) > 80:
+        raise HTTPException(status_code=400, detail="Sector name must be between 2 and 80 characters.")
+    if not all(c.isalnum() or c in " _-" for c in sector_clean):
+        raise HTTPException(status_code=400, detail="Sector name must contain only letters, numbers, spaces, hyphens, or underscores.")
+
+    cache_key = f"{sector_clean}:{session_id}"
+    if not force_refresh and cache_key in analysis_cache:
+        cached = analysis_cache[cache_key]
+        return AnalysisResponse(**cached, cached=True)
+
+    sessions[session_id].request_count += 1
+    sessions[session_id].sectors_analyzed.append(sector_clean)
+
+    try:
+        analyzer = TradeAnalyzer()
+        report_md, metadata = await analyzer.analyze(sector_clean)
+    except Exception as exc:
+        logger.exception("Analysis error for sector=%s: %s", sector_clean, exc)
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {exc}") from exc
+
+    result = AnalysisResponse(sector=sector_clean, report=report_md, metadata=metadata, cached=False)
+    analysis_cache[cache_key] = result.model_dump()
+    return result
+
+@app.get("/sectors", tags=["Meta"])
+async def list_sectors():
+    return {
+        "supported_sectors": [
+            "pharmaceuticals", "technology", "agriculture", "textiles", "automotive",
+            "chemicals", "electronics", "renewable energy", "defense", "aerospace",
+            "food processing", "gems and jewelry", "steel", "oil and gas", "banking and finance",
+        ],
+        "note": "Any valid sector name is accepted.",
+    }
+
+@app.get("/session/info", tags=["Session"])
+async def session_info(session_id: str = Depends(get_current_session)):
+    info = sessions.get(session_id)
+    if not info:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return info

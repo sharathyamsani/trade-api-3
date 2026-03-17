@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: trade-opportunities-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false        # you'll paste this in the Render dashboard
+      - key: JWT_SECRET_KEY
+        generateValue: true  # Render auto-generates a secure random value
+      - key: SERPER_API_KEY
+        sync: false
