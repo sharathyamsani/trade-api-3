@@ -315,10 +315,10 @@ const SECTORS = [
   { name: "Renewable Energy", icon: "☀️", tag: "Solar & Wind" },
   { name: "Defense", icon: "🛡️", tag: "Aerospace & Arms" },
   { name: "Food Processing", icon: "🏭", tag: "FMCG & Exports" },
-  { name: "Gems & Jewelry", icon: "💎", tag: "Diamonds & Gold" },
+  { name: "Gems and Jewelry", icon: "💎", tag: "Diamonds & Gold" },
   { name: "Steel", icon: "⚙️", tag: "Metals & Mining" },
-  { name: "Oil & Gas", icon: "🛢️", tag: "Energy Sector" },
-  { name: "Banking & Finance", icon: "🏦", tag: "FinTech & BFSI" },
+  { name: "Oil and Gas", icon: "🛢️", tag: "Energy Sector" },
+  { name: "Banking and Finance", icon: "🏦", tag: "FinTech & BFSI" },
   { name: "Telecom", icon: "📡", tag: "5G & Connectivity" },
 ];
 
